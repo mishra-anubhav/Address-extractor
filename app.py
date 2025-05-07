@@ -2,161 +2,211 @@ import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import re
 from io import BytesIO
-import unicodedata
+import ast
+from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from openai import OpenAI
+import time
 
-st.set_page_config(page_title="📬 Smart Address Extractor", layout="centered")
-st.title("📬 Website Address Extractor with Contact + Location Logic")
-st.write("Upload an Excel file with a column named **URL**. This app will extract all address info from the site’s main page, contact pages, and location pages.")
+# Optional: rotate between multiple API keys (must be from separate paid accounts to truly parallelize)
+OPENAI_KEYS = [
+    st.secrets["openai_api_key"],
+    # Add more keys here if you have them
+]
 
-# Extract all address-like data from <address> or regex
-def extract_addresses_from_html(htmlContent):
-    soup = BeautifulSoup(htmlContent, "html.parser")
-    addresses = set()
+def get_client(thread_id):
+    key = OPENAI_KEYS[thread_id % len(OPENAI_KEYS)]
+    return OpenAI(api_key=key)
 
-    # Step 1: Collect from <address> tag (best-case)
-    for tag in soup.find_all("address"):
-        text = tag.get_text(separator=" ", strip=True)
-        if text:
-            addresses.add(text)
+# --- UI Styling ---
+st.set_page_config(page_title="📬 GPT-4o Address Extractor", layout="centered")
 
-    # Step 2: Heuristic search in <div>, <p>, <li>, <span> with context
-    candidateTags = soup.find_all(["div", "p", "li", "span"])
-    keywords = ["address", "location", "clinic", "directions", "find us", "visit us", "headquarters"]
+st.markdown(
+    """
+    <style>
+    html, body, [class*="css"]  {
+        font-family: 'Segoe UI', sans-serif;
+    }
+    .main-title {
+        background: linear-gradient(90deg, rgba(37,150,190,1) 0%, rgba(15,100,180,1) 100%);
+        color: white;
+        padding: 1.2rem;
+        border-radius: 8px;
+        text-align: center;
+        font-size: 1.8rem;
+        margin-bottom: 2rem;
+    }
+    .section-header {
+        font-size: 1.25rem;
+        margin-top: 1.5rem;
+        padding-bottom: 0.2rem;
+        border-bottom: 2px solid #2596be;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
-    for tag in candidateTags:
-        text = tag.get_text(separator=" ", strip=True)
-        textLower = text.lower()
+st.markdown('<div class="main-title">📬 GPT-4o Powered Address Extractor</div>', unsafe_allow_html=True)
+st.write("This app extracts real mailing addresses from websites using GPT-4o. It scans the homepage and related contact/location pages with smart chunking.")
 
-        # Skip super short or unrelated content
-        if len(text) < 20:
+# 🔍 GPT function with chunk merge
+def gpt_extract_chunked_text(chunks, thread_id):
+    all_addresses = []
+    client = get_client(thread_id)
+
+    for chunk in chunks:
+        prompt = f"""
+You are a strict mailing address extractor.
+
+Extract only real, physical addresses from the text below. Format the output as a clean Python list of lists:
+[["Street", "City", "State", "ZIP"], ...]
+
+No phone numbers, names, or guesses. If nothing, return [].
+
+Text:
+{chunk}
+"""
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            raw_output = response.choices[0].message.content.strip()
+            extracted = ast.literal_eval(raw_output)
+
+            if isinstance(extracted, list):
+                all_addresses.extend(extracted)
+        except:
             continue
 
-        # Check keyword presence or address-like structure
-        if any(keyword in textLower for keyword in keywords) or re.search(r"\d{1,5} [\w\s.,-]{10,}", text):
-            # Check if it looks like part of a US address (relaxed)
-            if re.search(r"[A-Z]{2} \d{5}", text) or re.search(r"\d{5}", text):
-                addresses.add(text)
+    if all_addresses:
+        seen = set()
+        cleaned = []
+        for parts in all_addresses:
+            flat = ", ".join(p.strip() for p in parts)
+            if flat not in seen:
+                seen.add(flat)
+                cleaned.append(flat)
+        return " | ".join(cleaned)
+    return ""
 
-    # Step 3: Regex fallback on raw text for isolated address strings
-    plainText = soup.get_text(separator=" ", strip=True)
-    matches = re.findall(r"\d{1,5}[\w\s\.,-]{5,40}(?:[A-Z]{2}\s?\d{5})", plainText)
-    for match in matches:
-        addresses.add(match.strip())
+# 🌐 Scrape and read page
+def fetch_page_text(url):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            return soup.get_text(separator=" ", strip=True)
+    except:
+        return ""
+    return ""
 
-    return list(addresses)
-
-
-# Find all contact/location-like pages
-def find_related_pages(baseUrl, htmlContent):
-    soup = BeautifulSoup(htmlContent, "html.parser")
-    relatedUrls = []
-    keywords = ["contact", "contact-us", "get-in-touch", "support", "location", "locations", "find-us", "our-offices"]
+# 🔗 Find contact/location subpages
+def find_subpages(baseUrl, html):
+    soup = BeautifulSoup(html, "html.parser")
+    pages = set()
+    keywords = ["contact", "location", "find-us", "get-in-touch"]
 
     for link in soup.find_all("a", href=True):
         href = link["href"].lower()
-        text = link.get_text().lower()
-        if any(keyword in href or keyword in text for keyword in keywords):
-            # Normalize to full URL
-            if href.startswith("http"):
-                relatedUrls.append(href)
-            elif href.startswith("/"):
-                relatedUrls.append(baseUrl.rstrip("/") + href)
+        if any(k in href for k in keywords):
+            full = urljoin(baseUrl, href)
+            pages.add(full)
+    return list(pages)
 
-    return list(set(relatedUrls))
+# 🧠 Main processor per URL
+def process_url_full(url, thread_id):
+    if not isinstance(url, str) or not url.strip():
+        return ""
 
-# Main address processor with fallback and progress bar
-def process_links(df):
-    results = []
-    noAddressCount = 0  # ✅ New counter
-    progress = st.progress(0)
-    total = len(df)
+    if not url.startswith("http"):
+        url = "https://" + url.strip()
 
-    for i, url in enumerate(df['URL']):
-        extractedAddresses = []
+    all_text = []
 
-        try:
-            if not isinstance(url, str) or url.strip() == "":
-                results.append("Invalid URL")
-                progress.progress((i + 1) / total)
-                continue
+    main_text = fetch_page_text(url)
+    if main_text:
+        all_text.append(main_text)
 
-            if not url.startswith("http://") and not url.startswith("https://"):
-                url = "https://" + url.strip()
+    sub_links = find_subpages(url, main_text)
+    for sub in sub_links:
+        sub_text = fetch_page_text(sub)
+        if sub_text:
+            all_text.append(sub_text)
 
-            headers = {"User-Agent": "Mozilla/5.0"}
+    combined = " ".join(all_text).strip()
+    chunks = [combined[i:i + 12000] for i in range(0, len(combined), 12000)]
+    return gpt_extract_chunked_text(chunks, thread_id)
 
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                extractedAddresses.extend(extract_addresses_from_html(res.text))
-                relatedUrls = find_related_pages(url, res.text)
+# ✅ Multithreaded batch
+def process_all(df, max_workers=10):
+    urls = df["URL"].tolist()
+    results = [None] * len(urls)
+    failed = []
 
-                for relatedUrl in relatedUrls:
-                    try:
-                        sub = requests.get(relatedUrl, headers=headers, timeout=10)
-                        if sub.status_code == 200:
-                            extractedAddresses.extend(extract_addresses_from_html(sub.text))
-                    except Exception:
-                        continue
-            else:
-                results.append(f"Failed: {res.status_code}")
-                progress.progress((i + 1) / total)
-                continue
+    start_time = time.time()
 
-        except Exception as e:
-            results.append(f"Error: {str(e)}")
-            progress.progress((i + 1) / total)
-            continue
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_url_full, url, i): i for i, url in enumerate(urls)}
+        progressBar = st.progress(0)
+        total = len(futures)
 
-        # Final formatting
-        # At the end of the loop, before appending:
-        final = list(set(extractedAddresses))
-        if final:
-            combined = " | ".join(final)
+        for idx, future in enumerate(as_completed(futures)):
+            i = futures[future]
+            try:
+                result = future.result()
+                results[i] = result if result.strip() else "Unknown"
+                if result.strip() == "":
+                    failed.append(urls[i])
+            except:
+                results[i] = "Unknown"
+                failed.append(urls[i])
 
-            # ✅ Clean and sanitize the combined string
-            combinedCleaned = unicodedata.normalize("NFKD", combined)
-            combinedCleaned = combinedCleaned.encode("ascii", "ignore").decode("ascii")  # remove weird symbols
-            combinedCleaned = combinedCleaned.replace("\n", " ").replace("\r", " ").strip()
+            elapsed = time.time() - start_time
+            avg_per_url = elapsed / (idx + 1)
+            remaining = avg_per_url * (total - (idx + 1))
+            progressBar.progress((idx + 1) / total)
+            st.caption(f"⏳ Estimated time left: {int(remaining)} sec")
 
-            # ✅ Limit to 500 characters max to avoid Excel crash
-            if len(combinedCleaned) > 500:
-                combinedCleaned = combinedCleaned[:500] + "… [truncated]"
+    df["Extracted Addresses"] = results
+    return df, failed
 
-            results.append(combinedCleaned)
-        else:
-            st.warning(f"⚠️ No address found for: {url}")
-            results.append("No address found")
-            noAddressCount += 1
-
-
-
-# Upload section
-uploadedFile = st.file_uploader("📤 Upload Excel File (.xlsx)", type=["xlsx"])
+# 📤 Upload UI
+st.markdown('<div class="section-header">📁 Upload Excel File</div>', unsafe_allow_html=True)
+uploadedFile = st.file_uploader("Upload your .xlsx file with a 'URL' column", type=["xlsx"])
 
 if uploadedFile:
     try:
         df = pd.read_excel(uploadedFile)
-        st.write("✅ Columns found:", df.columns.tolist())
-
         if "URL" not in df.columns:
             st.error("❌ Excel must contain a column named 'URL'.")
         else:
-            with st.spinner("Scraping all pages..."):
-                result_df = process_links(df)
+            st.success("✅ File uploaded successfully.")
 
-            st.success("🎉 Scraping complete!")
-            st.dataframe(result_df)
+            st.markdown('<div class="section-header">🔍 Extracting Addresses...</div>', unsafe_allow_html=True)
+            with st.spinner("Scanning websites using GPT-4o..."):
+                result_df, failed_urls = process_all(df)
+
+            st.success("✅ Extraction complete!")
+            st.dataframe(result_df, use_container_width=True)
 
             output = BytesIO()
             result_df.to_excel(output, index=False)
             st.download_button(
-                label="⬇️ Download Output Excel",
+                label="⬇️ Download Results",
                 data=output.getvalue(),
-                file_name="output_links_with_addresses.xlsx",
+                file_name="gpt4o_extracted_addresses.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
+            st.markdown('<div class="section-header">⚠️ Sites With No Address Found</div>', unsafe_allow_html=True)
+            st.markdown(f"**{len(failed_urls)}** out of **{len(df)}** sites had no address.")
+            if failed_urls:
+                st.dataframe(pd.DataFrame({"Check Manually": failed_urls}))
+
     except Exception as e:
-        st.error(f"❌ Failed to read file: {str(e)}")
+        st.error(f"❌ Failed to process file: {str(e)}")
