@@ -1,5 +1,6 @@
 streamlit
 pandas
-openpyxl
-beautifulsoup4
 requests
+beautifulsoup4
+openai>=1.0.0
+openpyxl
