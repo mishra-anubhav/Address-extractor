@@ -4,6 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 from io import BytesIO
+import unicodedata
 
 st.set_page_config(page_title="📬 Smart Address Extractor", layout="centered")
 st.title("📬 Website Address Extractor with Contact + Location Logic")
@@ -68,6 +69,7 @@ def find_related_pages(baseUrl, htmlContent):
 # Main address processor with fallback and progress bar
 def process_links(df):
     results = []
+    noAddressCount = 0  # ✅ New counter
     progress = st.progress(0)
     total = len(df)
 
@@ -85,7 +87,6 @@ def process_links(df):
 
             headers = {"User-Agent": "Mozilla/5.0"}
 
-            # Load main page
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
                 extractedAddresses.extend(extract_addresses_from_html(res.text))
@@ -96,7 +97,7 @@ def process_links(df):
                         sub = requests.get(relatedUrl, headers=headers, timeout=10)
                         if sub.status_code == 200:
                             extractedAddresses.extend(extract_addresses_from_html(sub.text))
-                    except Exception as e:
+                    except Exception:
                         continue
             else:
                 results.append(f"Failed: {res.status_code}")
@@ -109,17 +110,26 @@ def process_links(df):
             continue
 
         # Final formatting
+        # At the end of the loop, before appending:
         final = list(set(extractedAddresses))
         if final:
-            results.append(" | ".join(final))
+            combined = " | ".join(final)
+
+            # ✅ Clean and sanitize the combined string
+            combinedCleaned = unicodedata.normalize("NFKD", combined)
+            combinedCleaned = combinedCleaned.encode("ascii", "ignore").decode("ascii")  # remove weird symbols
+            combinedCleaned = combinedCleaned.replace("\n", " ").replace("\r", " ").strip()
+
+            # ✅ Limit to 500 characters max to avoid Excel crash
+            if len(combinedCleaned) > 500:
+                combinedCleaned = combinedCleaned[:500] + "… [truncated]"
+
+            results.append(combinedCleaned)
         else:
             st.warning(f"⚠️ No address found for: {url}")
             results.append("No address found")
+            noAddressCount += 1
 
-        progress.progress((i + 1) / total)
-
-    df['Extracted Addresses'] = results
-    return df
 
 
 # Upload section
