@@ -12,20 +12,40 @@ st.write("Upload an Excel file with a column named **URL**. This app will extrac
 # Extract all address-like data from <address> or regex
 def extract_addresses_from_html(htmlContent):
     soup = BeautifulSoup(htmlContent, "html.parser")
-    addresses = []
+    addresses = set()
 
-    # Get all <address> tags
+    # Step 1: Collect from <address> tag (best-case)
     for tag in soup.find_all("address"):
-        text = tag.get_text(strip=True)
+        text = tag.get_text(separator=" ", strip=True)
         if text:
-            addresses.append(text)
+            addresses.add(text)
 
-    # Regex fallback for US-style addresses
-    regexPattern = r"\d{1,5}\s[\w\s]{2,40},?\s[\w\s]{2,40},?\s[A-Z]{2}\s\d{5}"
-    matches = re.findall(regexPattern, soup.get_text())
-    addresses.extend(matches)
+    # Step 2: Heuristic search in <div>, <p>, <li>, <span> with context
+    candidateTags = soup.find_all(["div", "p", "li", "span"])
+    keywords = ["address", "location", "clinic", "directions", "find us", "visit us", "headquarters"]
 
-    return list(set(addresses))
+    for tag in candidateTags:
+        text = tag.get_text(separator=" ", strip=True)
+        textLower = text.lower()
+
+        # Skip super short or unrelated content
+        if len(text) < 20:
+            continue
+
+        # Check keyword presence or address-like structure
+        if any(keyword in textLower for keyword in keywords) or re.search(r"\d{1,5} [\w\s.,-]{10,}", text):
+            # Check if it looks like part of a US address (relaxed)
+            if re.search(r"[A-Z]{2} \d{5}", text) or re.search(r"\d{5}", text):
+                addresses.add(text)
+
+    # Step 3: Regex fallback on raw text for isolated address strings
+    plainText = soup.get_text(separator=" ", strip=True)
+    matches = re.findall(r"\d{1,5}[\w\s\.,-]{5,40}(?:[A-Z]{2}\s?\d{5})", plainText)
+    for match in matches:
+        addresses.add(match.strip())
+
+    return list(addresses)
+
 
 # Find all contact/location-like pages
 def find_related_pages(baseUrl, htmlContent):
@@ -57,6 +77,7 @@ def process_links(df):
         try:
             if not isinstance(url, str) or url.strip() == "":
                 results.append("Invalid URL")
+                progress.progress((i + 1) / total)
                 continue
 
             if not url.startswith("http://") and not url.startswith("https://"):
@@ -76,22 +97,30 @@ def process_links(df):
                         if sub.status_code == 200:
                             extractedAddresses.extend(extract_addresses_from_html(sub.text))
                     except Exception as e:
-                        st.warning(f"Subpage fetch error for {relatedUrl}: {str(e)}")
                         continue
             else:
                 results.append(f"Failed: {res.status_code}")
+                progress.progress((i + 1) / total)
                 continue
 
         except Exception as e:
             results.append(f"Error: {str(e)}")
+            progress.progress((i + 1) / total)
             continue
 
+        # Final formatting
         final = list(set(extractedAddresses))
-        results.append(" | ".join(final) if final else "No address found")
+        if final:
+            results.append(" | ".join(final))
+        else:
+            st.warning(f"⚠️ No address found for: {url}")
+            results.append("No address found")
+
         progress.progress((i + 1) / total)
 
     df['Extracted Addresses'] = results
     return df
+
 
 # Upload section
 uploadedFile = st.file_uploader("📤 Upload Excel File (.xlsx)", type=["xlsx"])
