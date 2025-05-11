@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 from io import BytesIO
 from urllib.parse import urljoin, urlparse
 from openai import OpenAI
-
+import ast 
 # ---- CONFIG ----
 client = OpenAI(api_key=st.secrets["openai_api_key"])
 st.set_page_config(
@@ -106,6 +106,23 @@ Here is the extracted page content:
         return response.choices[0].message.content.strip()
     except Exception as e:
         return f"❌ GPT Error: {e}"
+    
+def clean_and_deduplicate_addresses(raw_output):
+    try:
+        parsed = ast.literal_eval(raw_output)
+
+        # If it's not a list or is an empty list or list of empties
+        if not isinstance(parsed, list) or len(parsed) == 0 or all(not x for x in parsed):
+            return None  # Invalid
+
+        # Deduplicate using set of tuples
+        unique = list({tuple(addr) for addr in parsed if addr})
+        if not unique:
+            return None  # All entries were empty
+
+        return str(unique)
+    except Exception:
+        return None  # Parsing failed
 
 def process_url(url):
     allTextChunksFromMainAndSubpages = []
@@ -125,14 +142,20 @@ def process_url(url):
     combinedText = combinedText[:12000]
     gptResponseRaw = query_gpt_with_text(combinedText)
 
-    # Clean markdown formatting from GPT
+    # Remove wrapping markdown
     for prefix in ["```python", "```json", "```"]:
         if gptResponseRaw.startswith(prefix):
             gptResponseRaw = gptResponseRaw[len(prefix):].strip()
     if gptResponseRaw.endswith("```"):
         gptResponseRaw = gptResponseRaw[:-3].strip()
 
-    return combinedText, gptResponseRaw
+    # Deduplicate + validate
+    cleanedOutput = clean_and_deduplicate_addresses(gptResponseRaw)
+
+    if cleanedOutput is None:
+        return combinedText, "❌ No valid addresses"
+
+    return combinedText, cleanedOutput
 
 def process_all(df):
     urls = df["URL"].astype(str).fillna("").str.strip()
@@ -157,19 +180,22 @@ def process_all(df):
 
         try:
             combinedText, gptOutput = process_url(url)
-            if gptOutput.strip().startswith("❌ No text found."):
-                failedRows.append({"URL": originalUrl, "Error": "❌ No text found."})
-                progressText.markdown(f"❌ No text: `{domainName}`")
+
+            # Catch empty or invalid address lists
+            if gptOutput.strip().startswith("❌ No text found.") or gptOutput.strip() == "❌ No valid addresses":
+                failedRows.append({"URL": originalUrl, "Error": gptOutput.strip()})
+                progressText.markdown(f"❌ No address: `{domainName}`")
             else:
-                successRows.append({"URL": originalUrl, "Extracted Addresses": gptOutput})
+                successRows.append({"URL": originalUrl, "Extracted Addresses": gptOutput.strip()})
                 progressText.markdown(f"✅ Done: `{domainName}`")
+
         except Exception as e:
             failedRows.append({"URL": originalUrl, "Error": f"❌ Error: {e}"})
             progressText.markdown(f"❌ Failed: `{domainName}`")
 
         progressBar.progress((index + 1) / totalUrls)
 
-    # Success output
+    # ✅ Success Excel download
     if successRows:
         successDf = pd.DataFrame(successRows)
         st.success("🎉 Processed successfully.")
@@ -184,10 +210,10 @@ def process_all(df):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-    # Failed output
+    # ❌ Failed Excel download
     if failedRows:
         failedDf = pd.DataFrame(failedRows)
-        st.warning("⚠️ Some URLs failed to process.")
+        st.warning("⚠️ Some URLs failed or returned no addresses.")
         st.dataframe(failedDf)
 
         failedBuffer = BytesIO()
@@ -198,7 +224,7 @@ def process_all(df):
             file_name="gpt_failed_urls.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
+        
 # ---- FILE UPLOAD ----
 uploaded_file = st.file_uploader("📤 Upload Excel File (.xlsx)", type=["xlsx"])
 
