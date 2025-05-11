@@ -3,210 +3,221 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from io import BytesIO
-import ast
-from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse
 from openai import OpenAI
-import time
 
-# Optional: rotate between multiple API keys (must be from separate paid accounts to truly parallelize)
-OPENAI_KEYS = [
-    st.secrets["openai_api_key"],
-    # Add more keys here if you have them
-]
+# ---- CONFIG ----
+client = OpenAI(api_key=st.secrets["openai_api_key"])
+st.set_page_config(
+    page_title="AI-Powered Address Finder",
+    page_icon="📍",
+    layout="centered"
+)
 
-def get_client(thread_id):
-    key = OPENAI_KEYS[thread_id % len(OPENAI_KEYS)]
-    return OpenAI(api_key=key)
+# ---- MODERN STYLING ----
+st.markdown("""
+<style>
+/* Background gradient white → gray */
+html, body, [class*="css"]  {
+    font-family: 'Helvetica Neue', sans-serif;
+    background: linear-gradient(to bottom, #ffffff, #f2f2f5);
+    color: #111;
+}
 
-# --- UI Styling ---
-st.set_page_config(page_title="📬 GPT-4o Address Extractor", layout="centered")
+/* Headline */
+h1 {
+    text-align: center;
+    font-weight: 700;
+    font-size: 3em;
+    color: #111;
+    margin-top: 0.5em;
+    margin-bottom: 0.25em;
+}
 
+/* Description */
+.description {
+    text-align: left;
+    font-size: 1.1em;
+    color: #555;
+    margin-bottom: 2em;
+}
+
+/* Buttons */
+button[kind="primary"] {
+    background-color: #4f46e5;
+    color: white;
+    border-radius: 8px;
+    padding: 0.6em 1.2em;
+    font-size: 1em;
+}
+.stDownloadButton {
+    margin-top: 1em;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---- HEADER ----
+st.markdown("### 📍 AI-Powered Address Finder")
 st.markdown(
-    """
-    <style>
-    html, body, [class*="css"]  {
-        font-family: 'Segoe UI', sans-serif;
-    }
-    .main-title {
-        background: linear-gradient(90deg, rgba(37,150,190,1) 0%, rgba(15,100,180,1) 100%);
-        color: white;
-        padding: 1.2rem;
-        border-radius: 8px;
-        text-align: center;
-        font-size: 1.8rem;
-        margin-bottom: 2rem;
-    }
-    .section-header {
-        font-size: 1.25rem;
-        margin-top: 1.5rem;
-        padding-bottom: 0.2rem;
-        border-bottom: 2px solid #2596be;
-    }
-    </style>
-    """,
+    '<div class="description">Upload a list of URLs, and let our GPT-4o assistant extract accurate U.S. mailing addresses for you — fast, clean, and reliable.</div>',
     unsafe_allow_html=True
 )
 
-st.markdown('<div class="main-title">📬 GPT-4o Powered Address Extractor</div>', unsafe_allow_html=True)
-st.write("This app extracts real mailing addresses from websites using GPT-4o. It scans the homepage and related contact/location pages with smart chunking.")
-
-# 🔍 GPT function with chunk merge
-def gpt_extract_chunked_text(chunks, thread_id):
-    all_addresses = []
-    client = get_client(thread_id)
-
-    for chunk in chunks:
-        prompt = f"""
-You are a strict mailing address extractor.
-
-Extract only real, physical addresses from the text below. Format the output as a clean Python list of lists:
-[["Street", "City", "State", "ZIP"], ...]
-
-No phone numbers, names, or guesses. If nothing, return [].
-
-Text:
-{chunk}
-"""
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            raw_output = response.choices[0].message.content.strip()
-            extracted = ast.literal_eval(raw_output)
-
-            if isinstance(extracted, list):
-                all_addresses.extend(extracted)
-        except:
-            continue
-
-    if all_addresses:
-        seen = set()
-        cleaned = []
-        for parts in all_addresses:
-            flat = ", ".join(p.strip() for p in parts)
-            if flat not in seen:
-                seen.add(flat)
-                cleaned.append(flat)
-        return " | ".join(cleaned)
-    return ""
-
-# 🌐 Scrape and read page
+# ---- CORE LOGIC ----
 def fetch_page_text(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
-            return soup.get_text(separator=" ", strip=True)
+            return soup.get_text(separator=" ", strip=True), res.text
     except:
-        return ""
-    return ""
+        return "", ""
+    return "", ""
 
-# 🔗 Find contact/location subpages
-def find_subpages(baseUrl, html):
+def find_subpages(base_url, html):
     soup = BeautifulSoup(html, "html.parser")
-    pages = set()
-    keywords = ["contact", "location", "find-us", "get-in-touch"]
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].lower()
+        if any(x in href for x in ["contact", "location", "get-in-touch", "directions"]):
+            links.add(urljoin(base_url, href))
+    return list(links)
 
-    for link in soup.find_all("a", href=True):
-        href = link["href"].lower()
-        if any(k in href for k in keywords):
-            full = urljoin(baseUrl, href)
-            pages.add(full)
-    return list(pages)
+def query_gpt_with_text(text):
+    prompt = f"""
+You are a reliable assistant for extracting real-world physical mailing addresses.
 
-# 🧠 Main processor per URL
-def process_url_full(url, thread_id):
-    if not isinstance(url, str) or not url.strip():
-        return ""
+Return only physical mailing addresses in U.S. format as a Python list of lists like:
+[["123 Main St", "Dallas", "TX", "75201"], ["456 Center Blvd", "San Jose", "CA", "95110"]]
 
-    if not url.startswith("http"):
-        url = "https://" + url.strip()
+Do not include phone numbers, emails, names, or anything else.
 
-    all_text = []
-
-    main_text = fetch_page_text(url)
-    if main_text:
-        all_text.append(main_text)
-
-    sub_links = find_subpages(url, main_text)
-    for sub in sub_links:
-        sub_text = fetch_page_text(sub)
-        if sub_text:
-            all_text.append(sub_text)
-
-    combined = " ".join(all_text).strip()
-    chunks = [combined[i:i + 12000] for i in range(0, len(combined), 12000)]
-    return gpt_extract_chunked_text(chunks, thread_id)
-
-# ✅ Multithreaded batch
-def process_all(df, max_workers=10):
-    urls = df["URL"].tolist()
-    results = [None] * len(urls)
-    failed = []
-
-    start_time = time.time()
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_url_full, url, i): i for i, url in enumerate(urls)}
-        progressBar = st.progress(0)
-        total = len(futures)
-
-        for idx, future in enumerate(as_completed(futures)):
-            i = futures[future]
-            try:
-                result = future.result()
-                results[i] = result if result.strip() else "Unknown"
-                if result.strip() == "":
-                    failed.append(urls[i])
-            except:
-                results[i] = "Unknown"
-                failed.append(urls[i])
-
-            elapsed = time.time() - start_time
-            avg_per_url = elapsed / (idx + 1)
-            remaining = avg_per_url * (total - (idx + 1))
-            progressBar.progress((idx + 1) / total)
-            st.caption(f"⏳ Estimated time left: {int(remaining)} sec")
-
-    df["Extracted Addresses"] = results
-    return df, failed
-
-# 📤 Upload UI
-st.markdown('<div class="section-header">📁 Upload Excel File</div>', unsafe_allow_html=True)
-uploadedFile = st.file_uploader("Upload your .xlsx file with a 'URL' column", type=["xlsx"])
-
-if uploadedFile:
+Here is the extracted page content:
+{text}
+"""
     try:
-        df = pd.read_excel(uploadedFile)
-        if "URL" not in df.columns:
-            st.error("❌ Excel must contain a column named 'URL'.")
-        else:
-            st.success("✅ File uploaded successfully.")
-
-            st.markdown('<div class="section-header">🔍 Extracting Addresses...</div>', unsafe_allow_html=True)
-            with st.spinner("Scanning websites using GPT-4o..."):
-                result_df, failed_urls = process_all(df)
-
-            st.success("✅ Extraction complete!")
-            st.dataframe(result_df, use_container_width=True)
-
-            output = BytesIO()
-            result_df.to_excel(output, index=False)
-            st.download_button(
-                label="⬇️ Download Results",
-                data=output.getvalue(),
-                file_name="gpt4o_extracted_addresses.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-            st.markdown('<div class="section-header">⚠️ Sites With No Address Found</div>', unsafe_allow_html=True)
-            st.markdown(f"**{len(failed_urls)}** out of **{len(df)}** sites had no address.")
-            if failed_urls:
-                st.dataframe(pd.DataFrame({"Check Manually": failed_urls}))
-
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        st.error(f"❌ Failed to process file: {str(e)}")
+        return f"❌ GPT Error: {e}"
+
+def process_url(url):
+    allTextChunksFromMainAndSubpages = []
+
+    mainPageText, mainPageHTML = fetch_page_text(url)
+    allTextChunksFromMainAndSubpages.append(mainPageText)
+
+    subpagesList = find_subpages(url, mainPageHTML)
+    for subpage in subpagesList:
+        subPageText, _ = fetch_page_text(subpage)
+        allTextChunksFromMainAndSubpages.append(subPageText)
+
+    combinedText = " ".join(allTextChunksFromMainAndSubpages).strip()
+    if not combinedText:
+        return "", "❌ No text found."
+
+    combinedText = combinedText[:12000]
+    gptResponseRaw = query_gpt_with_text(combinedText)
+
+    # Clean markdown formatting from GPT
+    for prefix in ["```python", "```json", "```"]:
+        if gptResponseRaw.startswith(prefix):
+            gptResponseRaw = gptResponseRaw[len(prefix):].strip()
+    if gptResponseRaw.endswith("```"):
+        gptResponseRaw = gptResponseRaw[:-3].strip()
+
+    return combinedText, gptResponseRaw
+
+def process_all(df):
+    urls = df["URL"].astype(str).fillna("").str.strip()
+    successRows = []
+    failedRows = []
+
+    progressBar = st.progress(0)
+    progressText = st.empty()
+    totalUrls = len(urls)
+
+    for index, url in enumerate(urls):
+        originalUrl = url
+        if not url or url.lower() == "nan":
+            failedRows.append({"URL": originalUrl, "Error": "Invalid URL"})
+            continue
+
+        if not url.startswith("http"):
+            url = "https://" + url
+
+        domainName = urlparse(url).netloc
+        progressText.markdown(f"🔄 Processing: `{domainName}`")
+
+        try:
+            combinedText, gptOutput = process_url(url)
+            if gptOutput.strip().startswith("❌ No text found."):
+                failedRows.append({"URL": originalUrl, "Error": "❌ No text found."})
+                progressText.markdown(f"❌ No text: `{domainName}`")
+            else:
+                successRows.append({"URL": originalUrl, "Extracted Addresses": gptOutput})
+                progressText.markdown(f"✅ Done: `{domainName}`")
+        except Exception as e:
+            failedRows.append({"URL": originalUrl, "Error": f"❌ Error: {e}"})
+            progressText.markdown(f"❌ Failed: `{domainName}`")
+
+        progressBar.progress((index + 1) / totalUrls)
+
+    # Success output
+    if successRows:
+        successDf = pd.DataFrame(successRows)
+        st.success("🎉 Processed successfully.")
+        st.dataframe(successDf)
+
+        successBuffer = BytesIO()
+        successDf.to_excel(successBuffer, index=False)
+        st.download_button(
+            label="⬇️ Download Excel with Extracted Addresses",
+            data=successBuffer.getvalue(),
+            file_name="gpt_addresses_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    # Failed output
+    if failedRows:
+        failedDf = pd.DataFrame(failedRows)
+        st.warning("⚠️ Some URLs failed to process.")
+        st.dataframe(failedDf)
+
+        failedBuffer = BytesIO()
+        failedDf.to_excel(failedBuffer, index=False)
+        st.download_button(
+            label="⬇️ Download Excel with Failed URLs",
+            data=failedBuffer.getvalue(),
+            file_name="gpt_failed_urls.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+# ---- FILE UPLOAD ----
+uploaded_file = st.file_uploader("📤 Upload Excel File (.xlsx)", type=["xlsx"])
+
+if uploaded_file:
+    try:
+        df = pd.read_excel(uploaded_file)
+        st.success("✅ File uploaded.")
+
+        if "URL" not in df.columns:
+            st.error("❌ Excel must contain a column named `URL`.")
+        else:
+            st.info("⏳ Running GPT extraction. Please wait...")
+            process_all(df)
+    except Exception as e:
+        st.error(f"❌ Error reading file: {str(e)}")
+
+# ---- FOOTER ----
+st.markdown("""<hr style="margin-top:2em; margin-bottom:1em;">""", unsafe_allow_html=True)
+st.markdown(
+    '<div style="text-align:center; font-size:0.9em; color:#888;">Made with ❤️ by Anubhav</div>',
+    unsafe_allow_html=True
+)
