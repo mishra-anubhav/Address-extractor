@@ -99,7 +99,7 @@ Here is the extracted page content:
 """
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini-2024-07-18",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
